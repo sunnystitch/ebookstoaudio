@@ -36,6 +36,9 @@ var (
 	errUnsupportedAudioFormat = errors.New("unsupported audio format")
 	errNeedFFmpeg             = errors.New("ffmpeg is required for this output format")
 	errNeedEbookConvert       = errors.New("ebook-convert (calibre) is required for this input format")
+	reHanSpaceHan             = regexp.MustCompile(`([\p{Han}])\s+([\p{Han}])`)
+	reHanSpaceClosePunct      = regexp.MustCompile(`([\p{Han}])\s+([，。！？；：、）》】”’])`)
+	reOpenPunctSpaceHan       = regexp.MustCompile(`([（《【“‘])\s+([\p{Han}])`)
 	chapterRegexes            = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)^\s*chapter\s+\d+[\s:：-]?.*$`),
 		regexp.MustCompile(`^\s*第[0-9一二三四五六七八九十百千万零〇两]+章[\s:：-]?.*$`),
@@ -615,21 +618,36 @@ func normalizeText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	lastBlank := false
+	paragraphs := make([]string, 0, len(lines)/2)
+	mergedLines := make([]string, 0, 32)
+
+	flushParagraph := func() {
+		if len(mergedLines) == 0 {
+			return
+		}
+		paragraphs = append(paragraphs, joinLinesForSpeech(mergedLines))
+		mergedLines = mergedLines[:0]
+	}
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
-			if !lastBlank {
-				out = append(out, "")
-			}
-			lastBlank = true
+			flushParagraph()
 			continue
 		}
-		out = append(out, line)
-		lastBlank = false
+		if isChapterHeading(line) {
+			flushParagraph()
+			paragraphs = append(paragraphs, line)
+			continue
+		}
+		line = compactSpacesPreserveCJK(strings.Join(strings.Fields(line), " "))
+		if line == "" {
+			continue
+		}
+		mergedLines = append(mergedLines, line)
 	}
-	return strings.TrimSpace(strings.Join(out, "\n"))
+	flushParagraph()
+	return strings.TrimSpace(strings.Join(paragraphs, "\n\n"))
 }
 
 func splitChapters(text string) []chapter {
@@ -664,7 +682,7 @@ func splitChapters(text string) []chapter {
 	flush()
 
 	if len(chapters) > 0 {
-		return chapters
+		return splitLargeChapters(chapters, 6000)
 	}
 	return chunkByLength(text, 6000)
 }
@@ -679,21 +697,16 @@ func isChapterHeading(line string) bool {
 }
 
 func chunkByLength(text string, maxRunes int) []chapter {
-	rs := []rune(strings.TrimSpace(text))
-	if len(rs) == 0 {
+	parts := chunkTextBySentences(text, maxRunes)
+	if len(parts) == 0 {
 		return nil
 	}
-	var out []chapter
-	for start, part := 0, 1; start < len(rs); part++ {
-		end := start + maxRunes
-		if end > len(rs) {
-			end = len(rs)
-		}
+	out := make([]chapter, 0, len(parts))
+	for i, part := range parts {
 		out = append(out, chapter{
-			Title: fmt.Sprintf("Part_%02d", part),
-			Text:  strings.TrimSpace(string(rs[start:end])),
+			Title: fmt.Sprintf("Part_%02d", i+1),
+			Text:  part,
 		})
-		start = end
 	}
 	return out
 }
@@ -779,6 +792,371 @@ func synthesizeLinux(ctx context.Context, text, outPath, format, voice string, r
 	default:
 		return errUnsupportedAudioFormat
 	}
+}
+
+func splitLargeChapters(chapters []chapter, maxRunes int) []chapter {
+	if maxRunes <= 0 {
+		maxRunes = 6000
+	}
+	out := make([]chapter, 0, len(chapters))
+	for _, ch := range chapters {
+		parts := chunkTextBySentences(ch.Text, maxRunes)
+		if len(parts) <= 1 {
+			out = append(out, chapter{
+				Title: ch.Title,
+				Text:  prepareSpeechText(ch.Text),
+			})
+			continue
+		}
+		for i, part := range parts {
+			out = append(out, chapter{
+				Title: fmt.Sprintf("%s_%02d", ch.Title, i+1),
+				Text:  part,
+			})
+		}
+	}
+	return out
+}
+
+func chunkTextBySentences(text string, maxRunes int) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	if maxRunes <= 0 {
+		maxRunes = 6000
+	}
+
+	sentences := splitSentences(text)
+	if len(sentences) == 0 {
+		return hardChunkByRunes(text, maxRunes)
+	}
+
+	out := make([]string, 0, maxInt(1, len(sentences)/3))
+	var b strings.Builder
+	currentRunes := 0
+
+	flush := func() {
+		chunk := strings.TrimSpace(b.String())
+		if chunk != "" {
+			out = append(out, chunk)
+		}
+		b.Reset()
+		currentRunes = 0
+	}
+
+	for _, sentence := range sentences {
+		sentence = strings.TrimSpace(sentence)
+		if sentence == "" {
+			continue
+		}
+		rs := runeCount(sentence)
+		if rs > maxRunes {
+			flush()
+			out = append(out, splitLongSentence(sentence, maxRunes)...)
+			continue
+		}
+
+		extra := rs
+		if currentRunes > 0 {
+			extra++ // newline separator between sentences
+		}
+		if currentRunes > 0 && currentRunes+extra > maxRunes {
+			flush()
+		}
+		if currentRunes > 0 {
+			b.WriteByte('\n')
+			currentRunes++
+		}
+		b.WriteString(sentence)
+		currentRunes += rs
+	}
+	flush()
+
+	if len(out) == 0 {
+		return hardChunkByRunes(text, maxRunes)
+	}
+	return out
+}
+
+func splitLongSentence(sentence string, maxRunes int) []string {
+	rs := []rune(strings.TrimSpace(sentence))
+	if len(rs) == 0 {
+		return nil
+	}
+	if len(rs) <= maxRunes {
+		return []string{string(rs)}
+	}
+
+	clauses := make([]string, 0, 8)
+	start := 0
+	for i, r := range rs {
+		if !isClauseBreakRune(r) {
+			continue
+		}
+		part := strings.TrimSpace(string(rs[start : i+1]))
+		if part != "" {
+			clauses = append(clauses, part)
+		}
+		start = i + 1
+	}
+	if start < len(rs) {
+		part := strings.TrimSpace(string(rs[start:]))
+		if part != "" {
+			clauses = append(clauses, part)
+		}
+	}
+	if len(clauses) <= 1 {
+		return hardChunkByRunes(sentence, maxRunes)
+	}
+
+	out := make([]string, 0, len(clauses))
+	var b strings.Builder
+	currentRunes := 0
+	flush := func() {
+		chunk := strings.TrimSpace(b.String())
+		if chunk != "" {
+			out = append(out, chunk)
+		}
+		b.Reset()
+		currentRunes = 0
+	}
+
+	for _, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		rsLen := runeCount(clause)
+		if rsLen > maxRunes {
+			flush()
+			out = append(out, hardChunkByRunes(clause, maxRunes)...)
+			continue
+		}
+		extra := rsLen
+		if currentRunes > 0 {
+			extra++
+		}
+		if currentRunes > 0 && currentRunes+extra > maxRunes {
+			flush()
+		}
+		if currentRunes > 0 {
+			b.WriteByte('\n')
+			currentRunes++
+		}
+		b.WriteString(clause)
+		currentRunes += rsLen
+	}
+	flush()
+	return out
+}
+
+func hardChunkByRunes(text string, maxRunes int) []string {
+	rs := []rune(strings.TrimSpace(text))
+	if len(rs) == 0 {
+		return nil
+	}
+	if maxRunes <= 0 {
+		maxRunes = 6000
+	}
+
+	out := make([]string, 0, (len(rs)+maxRunes-1)/maxRunes)
+	for start := 0; start < len(rs); {
+		end := start + maxRunes
+		if end > len(rs) {
+			end = len(rs)
+		}
+		out = append(out, strings.TrimSpace(string(rs[start:end])))
+		start = end
+	}
+	return out
+}
+
+func prepareSpeechText(text string) string {
+	sentences := splitSentences(text)
+	if len(sentences) == 0 {
+		return strings.TrimSpace(text)
+	}
+	return strings.Join(sentences, "\n")
+}
+
+func splitSentences(text string) []string {
+	rs := []rune(strings.TrimSpace(text))
+	if len(rs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(rs)/20+1)
+	start := 0
+
+	appendSegment := func(seg string) {
+		seg = compactSpacesPreserveCJK(strings.Join(strings.Fields(strings.TrimSpace(seg)), " "))
+		if seg == "" {
+			return
+		}
+		out = append(out, ensureSentenceEnding(seg))
+	}
+
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if r == '\n' && i+1 < len(rs) && rs[i+1] == '\n' {
+			appendSegment(string(rs[start:i]))
+			start = i + 2
+			i++
+			continue
+		}
+		if !isSentenceTerminalRune(r) {
+			continue
+		}
+		end := i + 1
+		for end < len(rs) && isSentenceCloserRune(rs[end]) {
+			end++
+		}
+		appendSegment(string(rs[start:end]))
+		start = end
+		i = end - 1
+	}
+	if start < len(rs) {
+		appendSegment(string(rs[start:]))
+	}
+	return out
+}
+
+func joinLinesForSpeech(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	var prevLast rune
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if i > 0 && b.Len() > 0 {
+			first, _ := firstRune(line)
+			if !shouldJoinWithoutSpace(prevLast, first) {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteString(line)
+		prevLast, _ = lastRune(line)
+	}
+	return compactSpacesPreserveCJK(strings.TrimSpace(b.String()))
+}
+
+func compactSpacesPreserveCJK(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	for i := 0; i < 6; i++ {
+		before := text
+		text = reHanSpaceHan.ReplaceAllString(text, "$1$2")
+		text = reHanSpaceClosePunct.ReplaceAllString(text, "$1$2")
+		text = reOpenPunctSpaceHan.ReplaceAllString(text, "$1$2")
+		if text == before {
+			break
+		}
+	}
+	return text
+}
+
+func ensureSentenceEnding(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	r, ok := lastRune(s)
+	if !ok {
+		return s
+	}
+	if isSentenceTerminalRune(r) || isSentenceCloserRune(r) {
+		return s
+	}
+	if containsCJK(s) {
+		return s + "。"
+	}
+	return s + "."
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if isCJKRune(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldJoinWithoutSpace(left, right rune) bool {
+	if left == 0 || right == 0 {
+		return false
+	}
+	if isCJKRune(left) && isCJKRune(right) {
+		return true
+	}
+	if isCJKRune(left) && isCJKPunctuation(right) {
+		return true
+	}
+	if isCJKPunctuation(left) && isCJKRune(right) {
+		return true
+	}
+	return false
+}
+
+func isSentenceTerminalRune(r rune) bool {
+	switch r {
+	case '.', '!', '?', ';', '。', '！', '？', '；', '…':
+		return true
+	default:
+		return false
+	}
+}
+
+func isSentenceCloserRune(r rune) bool {
+	switch r {
+	case ')', ']', '}', '"', '\'', '）', '】', '》', '”', '’':
+		return true
+	default:
+		return false
+	}
+}
+
+func isClauseBreakRune(r rune) bool {
+	switch r {
+	case ',', '，', '、', ':', '：':
+		return true
+	default:
+		return false
+	}
+}
+
+func isCJKPunctuation(r rune) bool {
+	switch r {
+	case '，', '。', '！', '？', '；', '：', '、', '（', '）', '《', '》', '【', '】', '“', '”', '‘', '’':
+		return true
+	default:
+		return false
+	}
+}
+
+func isCJKRune(r rune) bool {
+	return unicode.In(r, unicode.Han)
+}
+
+func firstRune(s string) (rune, bool) {
+	for _, r := range s {
+		return r, true
+	}
+	return 0, false
+}
+
+func lastRune(s string) (rune, bool) {
+	rs := []rune(s)
+	if len(rs) == 0 {
+		return 0, false
+	}
+	return rs[len(rs)-1], true
 }
 
 func zipFilesToDisk(paths []string, zipPath string) error {
